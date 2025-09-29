@@ -25,12 +25,15 @@ def train_model(
     batch_size,
     save_folder_path,
     num_epochs,
-    batch_per_save = 20
+    loss_fn,
+    tokenizer = None,
+    clip_grad_norm = 2.0,
+    batch_per_save = 10
 ):
     model.cuda()
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
     
     # Arrays to store losses for plotting
     train_losses = []
@@ -41,6 +44,8 @@ def train_model(
     
     # Try to load latest checkpoint and get last epoch/batch
     last_epoch, last_batch = load_latest_checkpoint(save_folder_path, model)
+
+    batch_idx = last_batch
     
     # Training loop
     for epoch in range(last_epoch, num_epochs):
@@ -49,11 +54,9 @@ def train_model(
         print(f"\nEpoch {epoch}/{num_epochs}")
         # Skip entire epoch if we've already trained it
             
-        for batch_idx, (inputs, targets) in enumerate(train_loader):
-            # Skip batches we've already trained in current epoch
-            if epoch == last_epoch and batch_idx < last_batch:
-                print(f"Skipping batch {batch_idx}")
-                continue
+        for inputs, targets in train_loader:
+
+            batch_idx += 1
                 
             inputs = inputs.cuda()
             targets = targets.cuda()
@@ -62,6 +65,7 @@ def train_model(
             # Backward pass and optimize
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
             optimizer.step()
             
             # Print loss every 10 batches
@@ -84,11 +88,23 @@ def train_model(
                         test_inputs, test_targets = next(iter(test_loader))
                         test_inputs = test_inputs.cuda()
                         test_targets = test_targets.cuda()
+
+
                         test_outputs = model(test_inputs, test_targets[:, :-1])
-                        test_outputs = test_outputs.permute(0, 2, 1)
-                        test_loss = loss_fn(test_outputs, test_targets[:, 1:].long()).item()
+                        permuted_outputs = test_outputs.permute(0, 2, 1)
+                        test_loss = loss_fn(permuted_outputs, test_targets[:, 1:].long()).item()
                         test_losses.append(test_loss)
                         print(f"Test Loss: {test_loss:.4f}")
+
+                        print("Target:")
+                        target_text = ' '.join(tokenizer.decode(test_targets.cpu().numpy()))
+                        print(target_text)
+                        
+                        print("Output:")
+                        pred_id = test_outputs.argmax(dim=-1)
+                        output_text = ' '.join(tokenizer.decode(pred_id.cpu().numpy()))
+                        print(output_text)
+
                     except StopIteration:
                         print("No more test batches")
                         break

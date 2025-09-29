@@ -16,6 +16,7 @@ class ClassicTransformer(nn.Module):
                  num_encoders,
                  num_decoders,
                  d_ff, 
+                 loss_fn = nn.CrossEntropyLoss(ignore_index=0),
                  max_seq_len = 50000,
                  pad_id = 0,
                  sos_id = 1,
@@ -24,7 +25,7 @@ class ClassicTransformer(nn.Module):
                  dropout=0.1):
         super().__init__()
         
-        
+        self.loss_fn = loss_fn
         self.pad_id = pad_id
         self.sos_id = sos_id
         self.eos_id = eos_id
@@ -91,9 +92,11 @@ class ClassicTransformer(nn.Module):
     
     def compute_loss(self, src, tgt):
         outputs = self.forward(src, tgt)
+        outputs = outputs[:, :-1]
         outputs = outputs.permute(0, 2, 1)
-        loss = nn.CrossEntropyLoss(ignore_index=self.pad_id)(outputs, tgt[:, 1:].long())
+        loss = self.loss_fn(outputs, tgt[:, 1:].long())
         return loss
+
         
     def predict(self, src, tgt):
         output = self.forward(src, tgt)

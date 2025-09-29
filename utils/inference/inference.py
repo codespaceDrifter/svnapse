@@ -21,11 +21,11 @@ def inference(model, tokenizer, max_length=200):
 
                 if torch.all(next_token_ids == tokenizer.EOS_ID):
                     break
-                next_token_word = tokenizer.decode_tensor(next_token_ids.cpu())
+                next_token_word = tokenizer.decode(next_token_ids.cpu())
                 print(next_token_word[0], end=" ", flush=True)
 
-
-
                 y = torch.cat((y, next_token_ids), dim=1)
+
+        print()  # Add newline after generation is complete
 
             

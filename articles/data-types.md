@@ -14,4 +14,7 @@ i.e. Red Green Blue -> three seperate columns. if red, then red column = 1, othe
 ordered encoding for ordinal
 i.e. education level highschool, undergrad, grad -> 0, 1, 2
 
-
+fill in empty/error cells
+0 fill in 
+mean fill in: if it's numerical continuous
+mode fill in: if most are one type. i.e. most users are bronze level. just fill in bronze.

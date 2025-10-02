@@ -6,3 +6,6 @@ datasets
 matplotlib
 torchviz
 pillow
+datasets
+huggingface_hub
+hf_xet

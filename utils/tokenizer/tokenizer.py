@@ -139,7 +139,7 @@ class Tokenizer:
 
     def _fit_vocab_source(self, txt_path, k = 1000):
         bin_path = txt_path.replace('.txt', '.bin')
-        checkpoint_path = os.join(os.path.dirname(txt_path),'tokenizer_checkpoint.json')
+        checkpoint_path = os.path.join(os.path.dirname(txt_path),'tokenizer_checkpoint.json')
         while len(self.token_to_id) < self.vocab_size:
             # parse file into memmap
             self.parse_file(txt_path,bin_path)

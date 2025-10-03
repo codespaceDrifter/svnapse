@@ -166,19 +166,21 @@ class Tokenizer:
                     print ('current pair merged', self.id_to_token[id1] + self.id_to_token[id2])
                     print (f"counting pairs {i / len(token_ids) * 100 :.3f}%")
             del token_ids
-            # get top k pairs
+            # sort pairs
             sorted_pair_counts = sorted(pair_counts.items(), key = lambda x:x[1] , reverse  =True)
-            top_pairs = sorted_pair_counts[:k]
-
-            # add merged tokens
-            for (id1, id2), count in top_pairs:
+            # add merged tokens. use a added counter to make sure skips do not affect how much added per round
+            added = 0
+            for (id1, id2), _ in sorted_pair_counts:
                 if len(self.token_to_id) >= self.vocab_size:
+                    break
+                if added >= k:
                     break
                 merged_token = self.id_to_token[id1] + self.id_to_token[id2]
                 # skip duplicated merges: (a, bc) and (ab, c) could both be added in top pairs
                 if merged_token in self.token_to_id:
-                    break
+                    continue
                 self.token_to_id[merged_token] = len(self.token_to_id)
+                added += 1
 
             # temp checkpoint save to not lose all progress
             self.save(checkpoint_path)

@@ -139,6 +139,7 @@ class Tokenizer:
 
     def _fit_vocab_source(self, txt_path, k = 1000):
         bin_path = txt_path.replace('.txt', '.bin')
+        checkpoint_path = os.join(os.path.dirname(txt_path),'tokenizer_checkpoint.json')
         while len(self.token_to_id) < self.vocab_size:
             # parse file into memmap
             self.parse_file(txt_path,bin_path)
@@ -178,6 +179,9 @@ class Tokenizer:
                 if merged_token in self.token_to_id:
                     break
                 self.token_to_id[merged_token] = len(self.token_to_id)
+
+            # temp checkpoint save to not lose all progress
+            self.save(checkpoint_path)
 
             print (f'building tokenizer {len(self.token_to_id)} / {self.vocab_size} vocab')
 

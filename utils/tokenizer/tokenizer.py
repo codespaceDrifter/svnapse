@@ -1,4 +1,4 @@
-from numpy import dtype
+import numpy as np
 import torch
 import os
 import json
@@ -52,7 +52,7 @@ note that if the two tokens plused together exceed max_token_length they are not
 
 
 class Tokenizer:
-    def __init__(self, vocab_size=50000, max_token_length=24):
+    def __init__(self, vocab_size=32000, max_token_length=24):
         self.vocab_size = vocab_size
         self.max_token_length = max_token_length 
 
@@ -92,7 +92,6 @@ class Tokenizer:
 
     def _build_trie(self):
         self.trie = {}
-        self.trie["END_OF_TOKEN"] = 4
         for token, id in self.token_to_id.items():
             if token in self.special_tokens: 
                 continue
@@ -109,7 +108,7 @@ class Tokenizer:
         id_list = []
         text_length = len(text)
         while i < text_length:
-            max_walk_length = min(24, len(text)-i)
+            max_walk_length = min(self.max_token_length, len(text)-i)
             j = 0
             node = self.trie
             longest_token_id = self.UNK_ID
@@ -123,39 +122,27 @@ class Tokenizer:
             i = i + max(j,1) # if j first round not in trie, an UNK is still added but j = 0 which will not advance i which will cause permanent loop so we max(j,1)
         return np.array(id_list, dtype=np.int32)
 
-    def parse_file(self, input_filepath, output_filepath, chunk_size=10_000_000):
-        # First pass: count total tokens
-        total_tokens = 0
-        with open(input_filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                token_ids = self.tokenize(chunk)
-                total_tokens += len(token_ids)
-        # Create memory-mapped file. later accessible efficiently by slices
-        os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
-        mmap = np.memmap(output_filepath, dtype=np.int32, mode='w+', shape=(total_tokens,))
-        # Second pass: write tokens
-        offset = 0
-        with open(input_filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                token_ids = self.tokenize(chunk)
-                mmap[offset:offset+len(token_ids)] = token_ids #this data type directly writes to disk
-                offset += len(token_ids)
-        del mmap
+    # writes a bin file
+    # later open with memmap np.dtype = 32
+    def parse_file(self, input_file_path, output_file_path, chunk_size=10_000_000):
+        file_size = os.path.getsize(input_file_path)
+
+        with open(output_file_path, "wb") as fout:  # raw binary file
+            with open(input_file_path, "r", encoding="utf-8", errors="ignore") as fin:
+                # the := opereator assigns chunk and checks "if chunk"(check if it's not empty) at the same time
+                while chunk := fin.read(chunk_size):
+                    token_ids = self.tokenize(chunk)
+                    token_ids.tofile(fout)
+                    pos = fin.tell()
+                    print(f"parsing file chunk {pos / file_size * 100:.3f}%")
 
 
-    def _fit_vocab_source(self, txt_path, k = 500):
-        self._build_trie()
-        npy_path = txt_path.replace('.txt', '.npy')
+    def _fit_vocab_source(self, txt_path, k = 1000):
+        bin_path = txt_path.replace('.txt', '.bin')
         while len(self.token_to_id) < self.vocab_size:
             # parse file into memmap
-            self.parse_file(txt_path,npy_path)
-            token_ids = np.memmap(npy_path, dtype=np.int32, mode = 'r')
+            self.parse_file(txt_path,bin_path)
+            token_ids = np.memmap(bin_path, dtype=np.int32, mode = 'r')
             pair_counts = {}
             # count adjacent pairs for future token making
             for i in range(len(token_ids) - 1):
@@ -169,19 +156,30 @@ class Tokenizer:
                 if len(token1) + len(token2) > self.max_token_length:
                     continue
 
+
+
                 pair = (id1,id2)
                 pair_counts[pair] = pair_counts.get(pair,0) + 1
 
+                if (i % 1_000_000 == 0):
+                    print ('current pair merged', self.id_to_token[id1] + self.id_to_token[id2])
+                    print (f"counting pairs {i / len(token_ids) * 100 :.3f}%")
+            del token_ids
             # get top k pairs
             sorted_pair_counts = sorted(pair_counts.items(), key = lambda x:x[1] , reverse  =True)
             top_pairs = sorted_pair_counts[:k]
 
             # add merged tokens
             for (id1, id2), count in top_pairs:
-                if len(self.token_to_id) > self.vocab_size:
+                if len(self.token_to_id) >= self.vocab_size:
                     break
                 merged_token = self.id_to_token[id1] + self.id_to_token[id2]
+                # skip duplicated merges: (a, bc) and (ab, c) could both be added in top pairs
+                if merged_token in self.token_to_id:
+                    break
                 self.token_to_id[merged_token] = len(self.token_to_id)
+
+            print (f'building tokenizer {len(self.token_to_id)} / {self.vocab_size} vocab')
 
             #rebuild tokenizer
             self.id_to_token = {v: k for k, v in self.token_to_id.items()}
@@ -189,11 +187,13 @@ class Tokenizer:
 
 
     def save(self, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        d = os.path.dirname(path)
+        if d: #maybe it's just a file name with no folder prefix
+            os.makedirs(d, exist_ok=True)
 
         data = {
             "vocab_size": self.vocab_size,
-            "max_length": self.max_length,
+            "max_token_length": self.max_token_length,
             "token_to_id": self.token_to_id,
         }
 
@@ -207,9 +207,9 @@ class Tokenizer:
 
         tokenizer = cls(
             vocab_size=data["vocab_size"],
-            max_length=data["max_length"]
+            max_token_length=data["max_token_length"]
         )
-        tokenizer.token_to_idid = data["token_to_id"]
+        tokenizer.token_to_id = data["token_to_id"]
         tokenizer.id_to_token = {v: k for k, v in tokenizer.token_to_id.items()}
         tokenizer._build_trie()
         return tokenizer

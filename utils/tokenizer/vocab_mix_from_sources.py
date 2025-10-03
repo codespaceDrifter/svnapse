@@ -32,7 +32,7 @@ source_files = [
     './data/english_common/wikitext103.txt'
 ]
 
-target_size_gb = 1.0
+target_size_gb = 1
 
 output_file = 'models/classic_transformer_1b/tokenizer/data/mixed_vocab_data.txt'
 # ======================================

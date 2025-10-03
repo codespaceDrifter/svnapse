@@ -1,3 +1,7 @@
 venv
+__pycache__
 checkpoints
 data/
+*.bin
+*.txt
+tokenizer.json

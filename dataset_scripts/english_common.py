@@ -4,6 +4,8 @@
 # wiki text
 # minic4
 
+#run this in whereever you want to create the data folder
+
 import os
 from datasets import load_dataset
 
@@ -16,7 +18,7 @@ def dump_txt(dataset_name, split, out_file, config=None):
     else:
         ds = load_dataset(dataset_name, split=split)
 
-    path = os.path.join("data", out_file)
+    path = os.path.join("data/english_common", out_file)
     with open(path, "w", encoding="utf-8") as f:
         for ex in ds:
             t = ex.get("text")

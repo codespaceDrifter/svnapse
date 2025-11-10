@@ -137,7 +137,8 @@ class Tokenizer:
                     print(f"parsing file chunk {pos / file_size * 100:.3f}%")
 
 
-    def _fit_vocab_source(self, txt_path, k = 1000):
+    # if k is too big then the parallel merged tokens get too long too quickly
+    def _fit_vocab_source(self, txt_path, k = 500):
         bin_path = txt_path.replace('.txt', '.bin')
         checkpoint_path = os.path.join(os.path.dirname(txt_path),'tokenizer_checkpoint.json')
         while len(self.token_to_id) < self.vocab_size:

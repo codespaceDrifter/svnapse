@@ -1,12 +1,40 @@
 import torch
 import torch.nn as nn
-from ..basic.mask import create_mha_padding_mask, create_mha_causal_mask
-from .pos_encode import PositionalEncoding
+from ..encoding.mask import create_mha_padding_mask, create_mha_causal_mask
+from ..encoding.pos_encode import PositionalEncoding
 from ..basic.ffw import FeedForward
-from .mha import MultiHeadAttention
-from .transformer_encoder import TransformerEncoder
-from .transformer_decoder import TransformerDecoder
+from ..attention.mha import MultiHeadAttention
+from ..basic import Residual
 
+class ClassicTransformerEncoder(nn.Module):
+    def __init__(self, d_model, attention_block: nn.Module, feed_forward_block: nn.Module, dropout=0.1):
+        super().__init__()
+        self.attention =  attention_block
+        self.feed_forward = feed_forward_block
+        self.res1 = Residual(self.attention, d_model, dropout)
+        self.res2 = Residual(self.feed_forward, d_model, dropout)
+
+    def forward(self, x, padding_mask):
+        x = self.res1(x, Q = x, K = x, V = x, mask = padding_mask)
+        x = self.res2(x, x = x)
+        return x
+
+class ClassicTransformerDecoder(nn.Module):
+    def __init__(self, d_model, self_attention_block: nn.Module, cross_attention_block: nn.Module, feed_forward_block: nn.Module, dropout=0.1):
+        super().__init__()
+        self.self_attention = self_attention_block
+        self.cross_attention = cross_attention_block
+        self.feed_forward = feed_forward_block
+        self.res1 = Residual(self.self_attention, d_model, dropout)
+        self.res2 = Residual(self.cross_attention, d_model, dropout)
+        self.res3 = Residual(self.feed_forward, d_model, dropout)
+
+    def forward(self, x, encoder_output, self_mask, cross_mask):
+
+        x = self.res1(x, Q = x, K = x, V = x, mask = self_mask)
+        x = self.res2(x, Q = x, K = encoder_output, V = encoder_output, mask = cross_mask)
+        x = self.res3(x, x = x)
+        return x
 
 class ClassicTransformer(nn.Module):
     def __init__(self,
@@ -36,7 +64,7 @@ class ClassicTransformer(nn.Module):
 
         # Create encoder layers
         self.encoders = nn.ModuleList([
-            TransformerEncoder(
+            ClassicTransformerEncoder(
                 d_model,
                 MultiHeadAttention(d_model, num_heads),
                 FeedForward(d_model, d_ff),
@@ -47,7 +75,7 @@ class ClassicTransformer(nn.Module):
         
         # Create decoder layers
         self.decoders = nn.ModuleList([
-            TransformerDecoder(
+            ClassicTransformerDecoder(
                 d_model,
                 MultiHeadAttention(d_model, num_heads),
                 MultiHeadAttention(d_model, num_heads),

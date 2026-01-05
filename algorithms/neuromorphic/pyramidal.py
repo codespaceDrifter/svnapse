@@ -18,7 +18,8 @@ class Pyramidal(nn.Module):
     def forward(self, proximal_input, distal_input):
         proximal_output = self.proximal(proximal_input) # (batch_size, hidden_dim)
         distal_output = distal_input @ self.distal.T # (hidden_dim, batch_size, dendrite_dim)
-        distal_max = distal_output.max(dim=-1).values.T #(batch_size, hidden_dim)
+        abs_max_idx = distal_output.abs().argmax(dim=-1, keepdim=True)
+        distal_max = distal_output.gather(-1, abs_max_idx).squeeze(-1).T
         distal_modulate = torch.sigmoid(distal_max) # (batch_size, hidden_dim)
         result = proximal_output * distal_modulate # (batch_size, hidden_dim)
 

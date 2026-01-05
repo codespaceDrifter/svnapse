@@ -1,6 +1,7 @@
 '''
 RMSnorm scales by sqrt(n) and then multiplies by a learnable weight. 
 RMS is applied at the token level across the embed_dim. the total would be sqrt(n)*gamma rather than normal norm would be 1. 
+without gamma the mean(x_norm^2) = 1
 RMS(x) = sqrt (1/n * sum(x^2)) * gamma
 '''
 

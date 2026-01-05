@@ -17,3 +17,11 @@ Naive Bayes         |
 
 ```
 
+
+
+
+
+# training
+
+gradient accumulation  
+curriculum learning  

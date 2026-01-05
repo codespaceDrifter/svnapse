@@ -3,7 +3,7 @@ import torch.nn as nn
 from ..encoding.mask import create_mha_padding_mask, create_mha_causal_mask
 from ..encoding.pos_encode import PositionalEncoding
 from ..basic.ffw import FeedForward
-from ..attention.mha import MultiHeadAttention
+from ..attention.MHA import MultiHeadAttention
 from ..basic import Residual
 
 class ClassicTransformerEncoder(nn.Module):

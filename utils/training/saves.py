@@ -54,53 +54,61 @@ def save_checkpoint(path, model, optimizer, batch, quiz_history, total_train_tim
     if quiz_history:
         plt.figure(figsize=(10, 6))
 
-        # get all lessons from first entry
-        lessons = list(quiz_history[0][1].keys())
+        # collect all unique lessons across all entries, preserve order
+        all_lessons = []
+        for _, losses_dict in quiz_history:
+            for lesson in losses_dict:
+                if lesson not in all_lessons:
+                    all_lessons.append(lesson)
 
-        for lesson in lessons:
-            batches = [b for b, _ in quiz_history]
-            losses = [losses_dict[lesson] for _, losses_dict in quiz_history]
-            plt.plot(batches, losses, marker='o', markersize=3, label=lesson)
+        # consistent colors per lesson (hsv cycles through hues, works for any count)
+        cmap = plt.cm.get_cmap('hsv', len(all_lessons) + 1)
+
+        for i, lesson in enumerate(all_lessons):
+            # only include points where this lesson was quizzed
+            batches = [b for b, losses_dict in quiz_history if lesson in losses_dict]
+            losses = [losses_dict[lesson] for _, losses_dict in quiz_history if lesson in losses_dict]
+            plt.plot(batches, losses, marker='o', markersize=3, label=lesson, color=cmap(i))
 
         plt.xlabel("batch")
         plt.ylabel("loss")
+        plt.ylim(0, 10)
         plt.title("quiz loss per lesson")
-        plt.legend()
-        plt.savefig(os.path.join(meta_dir, "loss.png"), dpi=150)
+        plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        plt.savefig(os.path.join(meta_dir, "loss.png"), dpi=150, bbox_inches='tight')
         plt.close()
 
 
 def load_latest_checkpoint(folder, model, optimizer=None, scheduler=None):
     """Load checkpoint and training metadata. Returns (batch, quiz_history, total_train_time)."""
-    # load training metadata from json
-    json_path = os.path.join(folder, "metadata", "training_metadata.json")
-    if os.path.exists(json_path):
-        with open(json_path, "r") as f:
-            metadata = json.load(f)
-        batch = metadata.get('batch', 0)
-        # quiz_history: [(batch_idx, {lesson: loss, ...}), ...]
-        quiz_history = metadata.get('quiz_history', [])
-        # convert from json lists back to tuples
-        quiz_history = [(b, losses) for b, losses in quiz_history]
-        total_train_time = metadata.get('total_train_time', 0.0)
-    else:
-        return 0, [], 0.0
-
-    # load weights from .pt
+    # find .pt files
     files = [f for f in os.listdir(folder) if f.endswith(".pt") and not f.endswith(".tmp")]
     if not files:
         return 0, [], 0.0
 
     files_sorted = sorted(files, key=extract_batch, reverse=True)
 
+    # load metadata if exists
+    json_path = os.path.join(folder, "metadata", "training_metadata.json")
+    if os.path.exists(json_path):
+        with open(json_path, "r") as f:
+            metadata = json.load(f)
+        batch = metadata.get('batch', 0)
+        quiz_history = [(b, losses) for b, losses in metadata.get('quiz_history', [])]
+        total_train_time = metadata.get('total_train_time', 0.0)
+    else:
+        # no metadata - extract batch from filename, reset quiz history
+        batch = extract_batch(files_sorted[0])
+        quiz_history = []
+        total_train_time = 0.0
+
+    # load weights
     for checkpoint_file in files_sorted[:2]:
         try:
             path = os.path.join(folder, checkpoint_file)
             print(f"Loading checkpoint: {checkpoint_file}")
             checkpoint = torch.load(path)
 
-            # checkpoint has _orig_mod. prefix (compiled format)
-            # model at this point is compiled, so keys should match directly
             model.load_state_dict(checkpoint['model_state_dict'])
             if optimizer and 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])

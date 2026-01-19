@@ -1,215 +1,226 @@
-# curriculum learning - each bin file is a lesson
-# mix adjusted based on per-lesson eval loss
+# each batch is broken into minibatches and gradient accumulation to fit in vram
+# curriculum learning. each bin file is a lesson and can be chunked into multiple lessons
+# we set mix lesson percentage progressively using training loss (quizes)
 
 import time
 import random
 import torch
 import os
 import numpy as np
-from torch.utils.data import Dataset, DataLoader, Sampler
 
 from utils.training.saves import cleanup_checkpoints, load_latest_checkpoint, save_checkpoint
 
 
-class BinTokenDataset(Dataset):
-    def __init__(self, bin_path, seq_len):
-        self.data = np.memmap(bin_path, dtype=np.int32, mode='r')
+class Curriculum:
+    """
+    Holds multiple lessons (each a memmap .bin file), supports chunking.
+    Directly samples batches based on mix ratios.
+    """
+    def __init__(self, lesson_to_bin, seq_len, lesson_to_chunks=None):
+        if lesson_to_chunks is None:
+            lesson_to_chunks = {}
+
+        # ["story", "wikipedia_0", "wikipedia_1", ...] - expanded lesson names in order
+        self.lessons = []
+        # {"story": (memmap, start_sample, num_samples), ...}
+        self.data = {}
         self.seq_len = seq_len
-        self.num_samples = len(self.data) // seq_len
 
-    def __len__(self):
-        return self.num_samples
+        for lesson, path in lesson_to_bin.items():
+            mmap = np.memmap(path, dtype=np.int32, mode='r')
+            full_samples = len(mmap) // seq_len
+            n_chunks = lesson_to_chunks.get(lesson, 1)
 
-    def __getitem__(self, idx):
-        start = idx * self.seq_len
-        # (seq_len,) int64
-        return torch.from_numpy(self.data[start:start + self.seq_len].copy()).long()
+            if n_chunks == 1:
+                self.lessons.append(lesson)
+                self.data[lesson] = (mmap, 0, full_samples)
+            else:
+                chunk_size = full_samples // n_chunks
+                for i in range(n_chunks):
+                    chunk_name = f"{lesson}_{i}"
+                    start = i * chunk_size
+                    end = full_samples if i == n_chunks - 1 else start + chunk_size
+                    self.lessons.append(chunk_name)
+                    self.data[chunk_name] = (mmap, start, end - start)
+
+        # {"story": 100, ...} - num samples per lesson
+        self.sizes = {l: self.data[l][2] for l in self.lessons}
+
+    def sample_batch(self, lesson_to_mix, batch_size):
+        """Sample batch according to mix ratios. Returns (batch_size, seq_len) tensor."""
+        lessons = [l for l in self.lessons if lesson_to_mix.get(l, 0) > 0]
+        ratios = [lesson_to_mix[l] for l in lessons]
+
+        batch = []
+        for _ in range(batch_size):
+            lesson = random.choices(lessons, weights=ratios, k=1)[0]
+            mmap, start_sample, num_samples = self.data[lesson]
+            idx = random.randint(0, num_samples - 1)
+            offset = (start_sample + idx) * self.seq_len
+            # (seq_len,)
+            tokens = torch.from_numpy(mmap[offset:offset + self.seq_len].copy()).long()
+            batch.append(tokens)
+
+        # (batch_size, seq_len)
+        return torch.stack(batch)
+
+    def quiz_batch(self, lesson, batch_size):
+        """Sample batch from specific lesson for quizzing."""
+        mmap, start_sample, num_samples = self.data[lesson]
+        batch = []
+        for _ in range(batch_size):
+            idx = random.randint(0, num_samples - 1)
+            offset = (start_sample + idx) * self.seq_len
+            tokens = torch.from_numpy(mmap[offset:offset + self.seq_len].copy()).long()
+            batch.append(tokens)
+        return torch.stack(batch)
 
 
-class CurriculumDataset(Dataset):
+def fmt_mix(lesson_to_mix, priority_order):
+    """Format mix showing only first non-zero to last non-zero range."""
+    # find first and last non-zero indices
+    first, last = -1, -1
+    for i, lesson in enumerate(priority_order):
+        if lesson_to_mix.get(lesson, 0) > 0:
+            if first == -1:
+                first = i
+            last = i
+    if first == -1:
+        return "{}"
+    subset = priority_order[first:last + 1]
+    return "{" + ", ".join(f"{l}: {lesson_to_mix[l]:.3f}" for l in subset) + "}"
+
+
+def quiz_until_mix_full(model, curriculum, batch_size, quiz_batches, acceptable_loss, priority_order):
     """
-    Combined dataset from multiple lesson .bin files.
-    Example with 2 lessons: {"story": 100 samples, "code": 50 samples}
-      lessons = ["story", "code"]
-      sizes = {"story": 100, "code": 50}
-      boundaries = [0, 100, 150]  -> story is idx 0-99, code is idx 100-149
+    Quiz in priority order, stop early once mix is determined.
+    Returns (quiz_losses, all_passed, lesson_to_mix)
     """
-    def __init__(self, lesson_bin_paths, seq_len):
-        # ["story", "code", ...] - ordered list of lesson names
-        self.lessons = list(lesson_bin_paths.keys())
-        # {"story": BinTokenDataset, "code": BinTokenDataset, ...}
-        self.datasets = {l: BinTokenDataset(p, seq_len) for l, p in lesson_bin_paths.items()}
-        # {"story": 100, "code": 50, ...} - num samples per lesson
-        self.sizes = {l: len(ds) for l, ds in self.datasets.items()}
-
-        # [0, 100, 150] - cumulative boundaries for global idx -> lesson lookup
-        self.boundaries = [0]
-        for l in self.lessons:
-            self.boundaries.append(self.boundaries[-1] + self.sizes[l])
-
-    def __len__(self):
-        return self.boundaries[-1]
-
-    def __getitem__(self, idx):
-        # find which lesson this idx belongs to
-        for i, l in enumerate(self.lessons):
-            if idx < self.boundaries[i + 1]:
-                local_idx = idx - self.boundaries[i]
-                return self.datasets[l][local_idx]
-
-
-class CurriculumSampler(Sampler):
-    """
-    Infinite sampler - picks lesson first (based on mix), then random sample within lesson.
-    Rebuilt when mix changes after quiz.
-    """
-    def __init__(self, dataset, mix):
-        self.dataset = dataset
-        # [("story", 0.7), ("code", 0.3), ...] - lessons with non-zero mix
-        self.lesson_weights = [(l, mix[l]) for l in dataset.lessons if mix[l] > 0]
-
-    def __iter__(self):
-        lessons = [l for l, _ in self.lesson_weights]
-        weights = [w for _, w in self.lesson_weights]
-
-        while True:
-            # pick lesson based on mix probabilities
-            lesson = random.choices(lessons, weights=weights, k=1)[0]
-            # pick random sample within that lesson
-            lesson_idx = self.dataset.lessons.index(lesson)
-            start = self.dataset.boundaries[lesson_idx]
-            end = self.dataset.boundaries[lesson_idx + 1]
-            yield random.randint(start, end - 1)
-
-
-def make_curriculum_loader(dataset, mix, minibatch_size):
-    """Build DataLoader with CurriculumSampler from mix ratios."""
-    sampler = CurriculumSampler(dataset, mix)
-    return DataLoader(dataset, batch_size=minibatch_size, sampler=sampler, num_workers=2, pin_memory=True)
-
-
-def compute_mix_ratios(quiz_losses, acceptable_loss, priority_order):
-    """
-    raw_ratio = (loss - acceptable) / acceptable, capped [0, 1]
-    fill in priority order until sum = 1.0
-    scale up if total < 1.0
-
-    Returns (mix, all_passed) where all_passed is True if all lessons < acceptable_loss
-    """
-    all_passed = all(loss < acceptable_loss for loss in quiz_losses.values())
-
-    # if all passed, uniform mix (keep training everything equally)
-    if all_passed:
-        n = len(priority_order)
-        mix = {lesson: 1.0 / n for lesson in priority_order}
-        return mix, True
-
-    raw = {}
-    for lesson, loss in quiz_losses.items():
-        r = (loss - acceptable_loss) / acceptable_loss
-        raw[lesson] = max(0.0, min(1.0, r))
-
-    mix = {lesson: 0.0 for lesson in priority_order}
-    remaining = 1.0
-
-    for lesson in priority_order:
-        if remaining <= 0:
-            break
-        take = min(raw[lesson], remaining)
-        mix[lesson] = take
-        remaining -= take
-
-    total = sum(mix.values())
-    if 0< total < 1.0:
-        scale = 1.0 / total
-        mix = {k: v * scale for k, v in mix.items()}
-
-    return mix, False
-
-
-def quiz_lessons(model, dataset, batch_size, quiz_batches):
-    """Sample loss on each lesson from training data, return dict of losses."""
     model.eval()
     quiz_losses = {}
+    # {lesson: mix_ratio} - built gradually during quiz
+    lesson_to_mix = {l: 0.0 for l in priority_order}
+    # how much mix budget remains
+    remaining = 1.0
+    all_passed = True
+
+    loss_fn = torch.nn.CrossEntropyLoss()
+    samples_per_lesson = batch_size * quiz_batches
 
     with torch.no_grad():
-        for lesson in dataset.lessons:
-            ds = dataset.datasets[lesson]
-            loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+        for lesson in priority_order:
+            # (samples, seq_len)
+            tokens = curriculum.quiz_batch(lesson, samples_per_lesson).cuda()
 
             total_loss = 0.0
-            count = 0
-            for tokens in loader:
-                if count >= quiz_batches:
-                    break
-                # (batch, seq_len)
-                tokens = tokens.cuda()
-                _, loss = model(tokens, labels=tokens)
-                total_loss += loss.item()
-                count += 1
+            for start in range(0, samples_per_lesson, batch_size):
+                end = min(start + batch_size, samples_per_lesson)
+                # (chunk, seq_len)
+                chunk = tokens[start:end]
+                # (chunk, seq_len, vocab)
+                logits, _ = model(chunk, labels=chunk)
+                total_loss += loss_fn(
+                    logits[:, :-1].reshape(-1, logits.size(-1)),
+                    chunk[:, 1:].reshape(-1)
+                ).item() * (end - start)
 
-            assert count > 0
-            quiz_losses[lesson] = total_loss / count
+            loss = total_loss / samples_per_lesson
+            quiz_losses[lesson] = loss
+
+            if loss >= acceptable_loss:
+                all_passed = False
+                raw = min(1.0, (loss - acceptable_loss) / acceptable_loss)
+                # cap so we don't exceed 1.0 total
+                take = min(raw, remaining)
+                lesson_to_mix[lesson] = take
+                remaining -= take
+
+                if remaining <= 0:
+                    break
 
     model.train()
-    return quiz_losses
+
+    # if all passed, equal mix
+    if all_passed:
+        n = len(priority_order)
+        return quiz_losses, True, {l: 1.0 / n for l in priority_order}
+
+    # scale up if total < 1.0
+    total = sum(lesson_to_mix.values())
+    if 0 < total < 1.0:
+        lesson_to_mix = {k: v / total for k, v in lesson_to_mix.items()}
+
+    return quiz_losses, False, lesson_to_mix
 
 
 def train_curriculum(
-    lesson_bin_paths,       # {"lesson1": "path.bin", "lesson2": "path.bin", ...}
-    priority_order,         # ["lesson1", "lesson2", ...] - order to fill mix
+    # model
     model,
     optimizer,
-    batch_size,
-    seq_len,
-    save_folder_path,
-    acceptable_loss=3.0,
-    stop_streak=10,         # stop after all lessons < acceptable_loss for this many quizzes
-    tokenizer=None,
-    accumulation_steps=8,
     scheduler=None,
+    # training
+    batch_size=128,
+    accumulation_steps=8,
+    seq_len=2048,
     clip_grad_norm=1.0,
-    batches_per_save=100,
+    # data
+    lesson_to_bin=None,      # {"lesson1": "path.bin", ...}
+    priority_order=None,        # ["lesson1", "lesson2", ...] - curriculum order
+    save_folder_path="weights",
+    # curriculum
+    acceptable_loss=3.0,
+    stop_streak=10,
+    # logging
     batches_per_log=10,
+    batches_per_save=100,
     batches_per_quiz=100,
     quiz_batches=5,
+    tokenizer=None,
+    # chunking (most niche)
+    lesson_to_chunks=None,   # {"lesson1": 3, ...} - split lesson into N chunks
 ):
     assert batch_size % accumulation_steps == 0
     minibatch_size = batch_size // accumulation_steps
 
+    # expand priority_order for chunked lessons
+    if lesson_to_chunks is None:
+        lesson_to_chunks = {}
+    expanded_priority = []
+    for lesson in priority_order:
+        n_chunks = lesson_to_chunks.get(lesson, 1)
+        if n_chunks == 1:
+            expanded_priority.append(lesson)
+        else:
+            expanded_priority.extend(f"{lesson}_{i}" for i in range(n_chunks))
+    priority_order = expanded_priority
+
     model.cuda().bfloat16()
     os.makedirs(save_folder_path, exist_ok=True)
 
-    # combined dataset
-    dataset = CurriculumDataset(lesson_bin_paths, seq_len)
-    for l in dataset.lessons:
-        print(f"{l}: {dataset.sizes[l]} samples")
-    print(f"Total: {len(dataset)} samples")
+    curriculum = Curriculum(lesson_to_bin, seq_len, lesson_to_chunks)
+    for l in curriculum.lessons:
+        print(f"{l}: {curriculum.sizes[l]} samples")
+    print(f"Total: {sum(curriculum.sizes.values())} samples")
 
-    # checkpoint
     # quiz_history: [(batch_idx, {lesson: loss, ...}), ...]
     last_batch, quiz_history, prev_train_time = load_latest_checkpoint(
         save_folder_path, model, optimizer, scheduler
     )
     batch_idx = last_batch
     session_start_time = time.time()
-
-    # streak counter - how many consecutive quizzes with all lessons below acceptable_loss
     streak = 0
 
     # initial quiz
     print("\n=== Initial quiz ===")
-    quiz_losses = quiz_lessons(model, dataset, minibatch_size, quiz_batches)
+    quiz_losses, _, lesson_to_mix = quiz_until_mix_full(
+        model, curriculum, minibatch_size, quiz_batches, acceptable_loss, priority_order
+    )
     for l, loss in quiz_losses.items():
         print(f"  {l}: {loss:.4f}")
     quiz_history.append((batch_idx, quiz_losses.copy()))
-
-    mix, _ = compute_mix_ratios(quiz_losses, acceptable_loss, priority_order)
-    print(f"Initial mix: {mix}")
+    print(f"Initial mix: {fmt_mix(lesson_to_mix, priority_order)}")
 
     model.train()
-    loader = make_curriculum_loader(dataset, mix, minibatch_size)
-    minibatch_iter = iter(loader)
     batches_since_quiz = 0
 
     while True:
@@ -218,7 +229,7 @@ def train_curriculum(
 
         for _ in range(accumulation_steps):
             # (minibatch, seq_len)
-            tokens = next(minibatch_iter).cuda()
+            tokens = curriculum.sample_batch(lesson_to_mix, minibatch_size).cuda()
             logits, loss = model(tokens, labels=tokens)
             (loss / accumulation_steps).backward()
             acc_loss += loss.item()
@@ -248,7 +259,7 @@ def train_curriculum(
             elapsed = time.time() - session_start_time
             total_time = prev_train_time + elapsed
             print(f"Time: {fmt(total_time)} | Batch {batch_idx} | Loss: {avg_loss:.4f} | LR: {lr:.2e}")
-            print(f"Mix: {mix}")
+            print(f"Mix: {fmt_mix(lesson_to_mix, priority_order)}")
 
             if tokenizer:
                 pred = logits[0, :50].argmax(dim=-1).tolist()
@@ -259,19 +270,18 @@ def train_curriculum(
         # re-quiz and adjust mix
         if batches_since_quiz >= batches_per_quiz:
             print("\n--- Quiz ---")
-            quiz_losses = quiz_lessons(model, dataset, minibatch_size, quiz_batches)
+            quiz_losses, all_passed, lesson_to_mix = quiz_until_mix_full(
+                model, curriculum, minibatch_size, quiz_batches, acceptable_loss, priority_order
+            )
             for l, loss in quiz_losses.items():
                 print(f"  {l}: {loss:.4f}")
             quiz_history.append((batch_idx, quiz_losses.copy()))
-
-            mix, all_passed = compute_mix_ratios(quiz_losses, acceptable_loss, priority_order)
 
             if all_passed:
                 streak += 1
                 print(f"All lessons passed! Streak: {streak}/{stop_streak}")
                 if streak >= stop_streak:
                     print(f"\nTraining complete - {stop_streak} consecutive passes!")
-                    # final save
                     path = f"{save_folder_path}/batch_{batch_idx}.pt"
                     total_time = prev_train_time + (time.time() - session_start_time)
                     save_checkpoint(path, model, optimizer, batch_idx, quiz_history, total_time, scheduler)
@@ -281,10 +291,7 @@ def train_curriculum(
                     print(f"Streak reset (was {streak})")
                 streak = 0
 
-            print(f"New mix: {mix}")
-
-            loader = make_curriculum_loader(dataset, mix, minibatch_size)
-            minibatch_iter = iter(loader)
+            print(f"New mix: {fmt_mix(lesson_to_mix, priority_order)}")
             batches_since_quiz = 0
 
         # save
